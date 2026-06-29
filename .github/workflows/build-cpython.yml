@@ -1,0 +1,419 @@
+# =============================================================================
+# Build CPython  —  manual, version-parameterised, multi-platform
+# =============================================================================
+#
+# Inputs (Run workflow ▸):
+#   python_version  e.g. 3.8.20, 3.11.9, 3.12.5   (released CPython tags only)
+#   target_os       windows | ubuntu | fedora
+#                     windows  -> python.org-style .exe installer (+ fallback)
+#                     ubuntu   -> Debian/Ubuntu *family* tarball (covers Mint, Pop!_OS, …)
+#                     fedora   -> Fedora/RHEL *family* tarball
+#   optimize        false (default, fast) | true (PGO + LTO, release-grade, much slower)
+#
+# Why only two real dimensions (version + OS family) and x86-64 only:
+#   * 32-bit was dropped by request; 32-bit Windows is trivial to re-add (see notes
+#     at the bottom), 32-bit Linux would be a multilib cross-compile and is obsolete.
+#   * The Windows 7/10/11 sub-version is NOT an input: a build's minimum Windows is a
+#     *consequence* of the Python version, not a separate knob, so it is derived and
+#     documented instead. (3.8 runs on 7/8/10/11; a 3.8 build is a strict superset of
+#     a "Windows 10" 3.8 build.) Impossible pairs like "Win7 + 3.12" therefore cannot
+#     be expressed at all.
+#
+# The hard constraints this encodes (all verified against python.org / cpython):
+#   Python ≤ 3.8     -> min Windows 7    , MSVC toolset v142   (v143 dropped Win7/8 runtime)
+#   Python 3.9–3.10  -> min Windows 8.1  , MSVC toolset v142   (their props default to v142)
+#   Python 3.11      -> min Windows 8.1  , MSVC toolset v143   (native)
+#   Python ≥ 3.12    -> min Windows 10   , MSVC toolset v143   (native)
+#
+# Key Windows facts baked in:
+#   * Pinned to windows-2022 (NOT windows-latest): windows-2019 was removed 2025-06-30,
+#     windows-latest is a moving label, and windows-2022 is where the v142 toolset is
+#     confirmed present alongside v143.
+#   * The toolset is forced via the PlatformToolset *environment variable* (not /p:),
+#     because MSBuild reads env vars as global properties, so it applies to BOTH the
+#     interpreter build and the installer build. (The installer's launcher/pyshellext
+#     projects otherwise fail with MSB8020 independently of the main build.)
+#   * The installer bundle for ≤3.10 needs a compiled .chm (built via Doc\make.bat
+#     htmlhelp, which needs HTML Help Workshop). That is the fragile part for EOL
+#     versions, so if it fails the job still ships a portable interpreter zip.
+# =============================================================================
+
+name: Build CPython
+
+on:
+  workflow_dispatch:
+    inputs:
+      python_version:
+        description: "CPython version, e.g. 3.8.20 / 3.11.9 / 3.12.5 (released tags only)"
+        required: true
+        default: "3.12.5"
+        type: string
+      target_os:
+        description: "Target platform family"
+        required: true
+        default: "windows"
+        type: choice
+        options:
+          - windows
+          - ubuntu   # Debian/Ubuntu family (Mint, Pop!_OS, Debian, …)
+          - fedora   # Fedora/RHEL family
+      optimize:
+        description: "Release-grade build (PGO + LTO). Much slower; off = plain optimized build."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-cpython-${{ inputs.python_version }}-${{ inputs.target_os }}-${{ inputs.optimize }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Validate & plan
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      minor: ${{ steps.plan.outputs.minor }}
+      windows_toolset: ${{ steps.plan.outputs.windows_toolset }}
+      needs_docs: ${{ steps.plan.outputs.needs_docs }}
+      min_windows: ${{ steps.plan.outputs.min_windows }}
+    steps:
+      - id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER='${{ inputs.python_version }}'
+          OS='${{ inputs.target_os }}'
+
+          if [[ ! "$VER" =~ ^3\.[0-9]+\.[0-9]+([abrc][0-9]+)?$ ]]; then
+            echo "::error::Invalid version '$VER'. Expected CPython 3.Y.Z (e.g. 3.8.20, 3.12.5)."
+            echo "::error::Python 2.x and arbitrary strings are not supported by this workflow."
+            exit 1
+          fi
+          MINOR="$(echo "$VER" | cut -d. -f2)"
+
+          if [[ "$OS" == "windows" && "$MINOR" -lt 6 ]]; then
+            echo "::error::Windows builds below 3.6 rely on a build system and pinned externals"
+            echo "::error::that are no longer reproducible on current runners. Not supported."
+            exit 1
+          fi
+
+          TAG="v$VER"
+          if ! git ls-remote --exit-code --tags https://github.com/python/cpython "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::Tag '$TAG' was not found in python/cpython."
+            echo "::error::Only released versions have tags (e.g. 3.8.20 exists; 3.8.21 does not)."
+            exit 1
+          fi
+
+          TOOLSET=""
+          NEEDS_DOCS="false"
+          if [[ "$MINOR" -le 10 ]]; then TOOLSET="v142"; NEEDS_DOCS="true"; fi
+
+          if   [[ "$MINOR" -le 8  ]]; then MINWIN="Windows 7";
+          elif [[ "$MINOR" -le 11 ]]; then MINWIN="Windows 8.1";
+          else                             MINWIN="Windows 10";
+          fi
+
+          {
+            echo "tag=$TAG"
+            echo "minor=$MINOR"
+            echo "windows_toolset=$TOOLSET"
+            echo "needs_docs=$NEEDS_DOCS"
+            echo "min_windows=$MINWIN"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Build plan"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| CPython | \`$VER\` (tag \`$TAG\`) |"
+            echo "| Target | \`$OS\` · x86-64 |"
+            echo "| Optimized (PGO/LTO) | \`${{ inputs.optimize }}\` |"
+            if [[ "$OS" == "windows" ]]; then
+              echo "| MSVC toolset | \`${TOOLSET:-v143 (native)}\` |"
+              echo "| Minimum Windows | $MINWIN |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-windows:
+    name: Windows x86-64 installer
+    needs: plan
+    if: inputs.target_os == 'windows'
+    runs-on: windows-2022
+    timeout-minutes: 150
+    env:
+      PlatformToolset: ${{ needs.plan.outputs.windows_toolset }}
+    steps:
+      - name: Checkout CPython ${{ needs.plan.outputs.tag }}
+        uses: actions/checkout@v6
+        with:
+          repository: python/cpython
+          ref: ${{ needs.plan.outputs.tag }}
+          fetch-depth: 1
+
+      - name: Verify v142 toolset is present (fail fast)
+        if: needs.plan.outputs.windows_toolset == 'v142'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $path = & $vswhere -latest -products * `
+                    -requires Microsoft.VisualStudio.ComponentGroup.VC.Tools.142.x86.x64 `
+                    -property installationPath
+          if (-not $path) {
+            Write-Host "::error::The v142 (VS2019) build tools required for Python ${{ inputs.python_version }} are not installed on this runner."
+            Write-Host "::error::This build needs v142 specifically because v143 dropped the Windows 7/8 runtime that <=3.10 targets."
+            Write-Host "::error::Re-add it on a self-hosted runner with: Microsoft.VisualStudio.ComponentGroup.VC.Tools.142.x86.x64"
+            exit 1
+          }
+          Write-Host "v142 toolset found at: $path"
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Setup host Python (documentation toolchain)
+        if: needs.plan.outputs.needs_docs == 'true'
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Download external dependencies
+        shell: cmd
+        run: |
+          cd PCbuild
+          call get_externals.bat
+
+      - name: Build full installer (primary, best-effort)
+        id: installer
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          $pgo = @()
+          if ('${{ inputs.optimize }}' -ne 'true') {
+            if ('${{ needs.plan.outputs.needs_docs }}' -eq 'true') { $pgo = @('--pgo','-V') }
+            else { $pgo = @('--skip-pgo') }
+          }
+
+          $docflag = @()
+          if ('${{ needs.plan.outputs.needs_docs }}' -eq 'true') {
+            choco install html-help-workshop -y --no-progress
+            python -m pip install --upgrade pip
+            pip install -r Doc\requirements.txt 2>$null
+            if ($LASTEXITCODE -ne 0) { pip install sphinx python-docs-theme blurb }
+            $env:PYTHON     = (Get-Command python).Source
+            $env:SPHINXBUILD = (Get-Command sphinx-build).Source
+          } else {
+            $docflag = @('--skip-doc')
+          }
+
+          $brArgs = @('-x64','--skip-nuget','-o',$out) + $pgo + $docflag
+          $brArgsStr = $brArgs -join ' '
+          
+          Write-Host "=== PRIMARY: Running Tools\msi\buildrelease.bat ==="
+          Write-Host "Tools\msi\buildrelease.bat $brArgsStr"
+          
+          # Use cmd /c and 2>&1 to prevent PowerShell from swallowing stderr
+          cmd /c `"$env:GITHUB_WORKSPACE\Tools\msi\buildrelease.bat`" $brArgsStr 2>&1
+          
+          Write-Host "=== buildrelease.bat exit code: $LASTEXITCODE ==="
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Fallback portable build (only if the installer didn't complete)
+        if: always() && steps.installer.outcome == 'failure'
+        shell: pwsh
+        run: |
+          Write-Host "=== FALLBACK: Running PCbuild\build.bat ==="
+          
+          # Use cmd /c and 2>&1 to prevent PowerShell from swallowing stderr
+          cmd /c `"$env:GITHUB_WORKSPACE\PCbuild\build.bat`" -p x64 -c Release 2>&1
+          
+          Write-Host "=== build.bat exit code: $LASTEXITCODE ==="
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $src   = "$env:GITHUB_WORKSPACE\PCbuild\amd64"
+          $out   = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          $stage = Join-Path $env:RUNNER_TEMP "portable\python-${{ inputs.python_version }}"
+          New-Item -ItemType Directory -Force -Path $out, $stage | Out-Null
+          Copy-Item -Path "$src\*.exe","$src\*.dll","$src\*.pyd" -Destination $stage -ErrorAction SilentlyContinue
+          Copy-Item -Path "$env:GITHUB_WORKSPACE\Lib" -Destination (Join-Path $stage 'Lib') -Recurse
+          Compress-Archive -Path $stage -Force `
+            -DestinationPath (Join-Path $out "python-${{ inputs.python_version }}-windows-x86_64-portable.zip")
+
+      - name: Collect, checksum and report
+        if: always()
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Get-ChildItem "$env:GITHUB_WORKSPACE\PCbuild\amd64\en-us" -Include *.exe,*.zip -Recurse -ErrorAction SilentlyContinue |
+            Copy-Item -Destination $out -ErrorAction SilentlyContinue
+
+          $files = Get-ChildItem $out -Include *.exe,*.zip -Recurse -ErrorAction SilentlyContinue
+          if (-not $files) { Write-Host "::error::No installer or portable artifact was produced."; exit 1 }
+
+          $sums = Join-Path $out 'SHA256SUMS.txt'
+          $files | Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "{0}  {1}" -f $_.Hash, (Split-Path $_.Path -Leaf) } |
+            Set-Content $sums
+          "### Windows artifacts" | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          ""                      | Out-File -Append $env:GITHUB_STEP_SUMMARY
+          Get-Content $sums | ForEach-Object { "- ``$_``" } | Out-File -Append $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: cpython-${{ inputs.python_version }}-windows-x86_64
+          path: dist/**
+          if-no-files-found: error
+
+  build-linux-debian:
+    name: Linux (Debian/Ubuntu family) x86-64
+    needs: plan
+    if: inputs.target_os == 'ubuntu'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config ca-certificates \
+            libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev \
+            libncurses-dev libffi-dev liblzma-dev uuid-dev tk-dev \
+            libgdbm-dev libgdbm-compat-dev xz-utils libzstd-dev
+
+      - name: Checkout CPython ${{ needs.plan.outputs.tag }}
+        uses: actions/checkout@v6
+        with:
+          repository: python/cpython
+          ref: ${{ needs.plan.outputs.tag }}
+          fetch-depth: 1
+          path: cpython
+
+      - name: Configure, build and install
+        run: |
+          set -euo pipefail
+          VER='${{ inputs.python_version }}'
+          DEST="$GITHUB_WORKSPACE/_install/python-$VER"
+          OPT=()
+          if [ '${{ inputs.optimize }}' = 'true' ]; then OPT=(--enable-optimizations --with-lto); fi
+          cd cpython
+          ./configure --prefix="$DEST" --with-ensurepip=install "${OPT[@]}"
+          make -j"$(nproc)"
+          make altinstall
+
+      - name: Package, checksum and report
+        run: |
+          set -euo pipefail
+          VER='${{ inputs.python_version }}'
+          MM="${VER%.*}"                       
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          TARBALL="python-$VER-debian-ubuntu-x86_64.tar.gz"
+          tar -C "$GITHUB_WORKSPACE/_install" -czf "$GITHUB_WORKSPACE/dist/$TARBALL" "python-$VER"
+          cd "$GITHUB_WORKSPACE/dist"
+          sha256sum "$TARBALL" | tee SHA256SUMS.txt
+          GLIBC="$(ldd --version | head -n1 | awk '{print $NF}')"
+          {
+            echo "### Linux (Debian/Ubuntu) artifact"
+            echo ""
+            echo "- Built on \`ubuntu-24.04\` (glibc $GLIBC). Runs on Debian/Ubuntu/Mint releases with glibc ≥ this."
+            echo "- After extracting: \`./python-$VER/bin/python$MM --version\`"
+            echo "- \`$(cat SHA256SUMS.txt)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: cpython-${{ inputs.python_version }}-debian-ubuntu-x86_64
+          path: dist/**
+          if-no-files-found: error
+
+  build-linux-fedora:
+    name: Linux (Fedora/RHEL family) x86-64
+    needs: plan
+    if: inputs.target_os == 'fedora'
+    runs-on: ubuntu-24.04
+    container: fedora:latest
+    timeout-minutes: 120
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf -y install \
+            gcc gcc-c++ make git tar gzip xz findutils which gawk \
+            openssl-devel bzip2-devel libffi-devel zlib-devel xz-devel \
+            sqlite-devel readline-devel tk-devel gdbm-devel ncurses-devel \
+            libuuid-devel libzstd-devel
+
+      - name: Checkout CPython ${{ needs.plan.outputs.tag }}
+        uses: actions/checkout@v6
+        with:
+          repository: python/cpython
+          ref: ${{ needs.plan.outputs.tag }}
+          fetch-depth: 1
+          path: cpython
+
+      - name: Configure, build and install
+        run: |
+          set -euo pipefail
+          VER='${{ inputs.python_version }}'
+          DEST="$GITHUB_WORKSPACE/_install/python-$VER"
+          OPT=""
+          if [ '${{ inputs.optimize }}' = 'true' ]; then OPT="--enable-optimizations --with-lto"; fi
+          cd cpython
+          ./configure --prefix="$DEST" --with-ensurepip=install $OPT
+          make -j"$(nproc)"
+          make altinstall
+
+      - name: Package, checksum and report
+        run: |
+          set -euo pipefail
+          VER='${{ inputs.python_version }}'
+          MM="${VER%.*}"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          TARBALL="python-$VER-fedora-x86_64.tar.gz"
+          tar -C "$GITHUB_WORKSPACE/_install" -czf "$GITHUB_WORKSPACE/dist/$TARBALL" "python-$VER"
+          cd "$GITHUB_WORKSPACE/dist"
+          sha256sum "$TARBALL" | tee SHA256SUMS.txt
+          GLIBC="$(ldd --version | head -n1 | awk '{print $NF}')"
+          {
+            echo "### Linux (Fedora/RHEL) artifact"
+            echo ""
+            echo "- Built in \`fedora:latest\` (glibc $GLIBC). Runs on Fedora/RHEL-family releases with glibc ≥ this."
+            echo "- After extracting: \`./python-$VER/bin/python$MM --version\`"
+            echo "- \`$(cat SHA256SUMS.txt)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: cpython-${{ inputs.python_version }}-fedora-x86_64
+          path: dist/**
+          if-no-files-found: error
+
+# =============================================================================
+# Notes / how to extend
+# -----------------------------------------------------------------------------
+# Re-adding 32-bit Windows:  add an `architecture` choice input (x64|x86), pass
+#   -x86 instead of -x64 to buildrelease.bat / -p x64 -> -p Win32 to build.bat,
+#   and check the v141/v142 x86 component in the vswhere precheck. v143 supports x86.
+#
+# Reproducible Fedora:  replace `fedora:latest` with a currently-supported tag
+#   (e.g. `fedora:41`) — but keep it within Fedora's support window or dnf will fail.
+#
+# glibc portability:  these Linux tarballs link the build host's glibc, so they run
+#   on that distro family at that glibc vintage or newer. For maximal portability
+#   (old-glibc, run-anywhere), build inside a manylinux container (e.g.
+#   quay.io/pypa/manylinux2014_x86_64, glibc 2.17) instead of the native runner.
+#
+# EOL Windows docs:  for ≤3.10, the .chm/HTML-Help-Workshop step is the brittle link.
+#   If it fails, the job ships a portable interpreter zip. To always get the full
+#   .exe on those versions, run on a self-hosted Windows image with HTML Help
+#   Workshop and a known-good Sphinx baked in.
+# =============================================================================
