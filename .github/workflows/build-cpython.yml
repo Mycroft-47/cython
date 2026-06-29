@@ -219,7 +219,7 @@ jobs:
           Write-Host "Tools\msi\buildrelease.bat $brArgsStr"
           
           # Use cmd /c and 2>&1 to prevent PowerShell from swallowing stderr
-          cmd /c `"$env:GITHUB_WORKSPACE\Tools\msi\buildrelease.bat`" $brArgsStr 2>&1
+          cmd /c "`"$env:GITHUB_WORKSPACE\Tools\msi\buildrelease.bat`" $brArgsStr" 2>&1
           
           Write-Host "=== buildrelease.bat exit code: $LASTEXITCODE ==="
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -231,7 +231,7 @@ jobs:
           Write-Host "=== FALLBACK: Running PCbuild\build.bat ==="
           
           # Use cmd /c and 2>&1 to prevent PowerShell from swallowing stderr
-          cmd /c `"$env:GITHUB_WORKSPACE\PCbuild\build.bat`" -p x64 -c Release 2>&1
+          cmd /c "`"$env:GITHUB_WORKSPACE\PCbuild\build.bat`" -p x64 -c Release" 2>&1
           
           Write-Host "=== build.bat exit code: $LASTEXITCODE ==="
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
