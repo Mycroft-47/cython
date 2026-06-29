@@ -36,16 +36,6 @@
 #   * The installer bundle for ≤3.10 needs a compiled .chm (built via Doc\make.bat
 #     htmlhelp, which needs HTML Help Workshop). That is the fragile part for EOL
 #     versions, so if it fails the job still ships a portable interpreter zip.
-#
-# Changes from previous version:
-#   * Bumped all actions to Node.js 24-native versions:
-#       actions/checkout@v4      -> @v6
-#       actions/setup-python@v5  -> @v6
-#       actions/upload-artifact@v4 -> @v6
-#       microsoft/setup-msbuild@v2 -> @v3
-#   * Fixed quoting bug in buildrelease.bat call: replaced `cmd /c "path" argstring`
-#     (which broke on paths with spaces) with `& "path" @argArray` (PowerShell
-#     splatting), which handles spaces in path and args correctly.
 # =============================================================================
 
 name: Build CPython
@@ -73,20 +63,14 @@ on:
         default: false
         type: boolean
 
-# Least privilege: we only read the public cpython repo and upload artifacts.
 permissions:
   contents: read
 
-# Don't let two identical (version + OS) runs of this manual workflow stack up.
 concurrency:
   group: build-cpython-${{ inputs.python_version }}-${{ inputs.target_os }}-${{ inputs.optimize }}
   cancel-in-progress: false
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # 1. PLAN — validate the request and derive everything the build jobs need.
-  #    Fails fast (before any 1–2 hour build) on bad input or impossible asks.
-  # ---------------------------------------------------------------------------
   plan:
     name: Validate & plan
     runs-on: ubuntu-24.04
@@ -104,7 +88,6 @@ jobs:
           VER='${{ inputs.python_version }}'
           OS='${{ inputs.target_os }}'
 
-          # --- 1. Format check: CPython 3.Y.Z (optionally a1/b2/rc3). Reject Python 2.x. ---
           if [[ ! "$VER" =~ ^3\.[0-9]+\.[0-9]+([abrc][0-9]+)?$ ]]; then
             echo "::error::Invalid version '$VER'. Expected CPython 3.Y.Z (e.g. 3.8.20, 3.12.5)."
             echo "::error::Python 2.x and arbitrary strings are not supported by this workflow."
@@ -112,14 +95,12 @@ jobs:
           fi
           MINOR="$(echo "$VER" | cut -d. -f2)"
 
-          # --- 2. Windows sanity floor (older series use an obsolete, unfetchable toolchain) ---
           if [[ "$OS" == "windows" && "$MINOR" -lt 6 ]]; then
             echo "::error::Windows builds below 3.6 rely on a build system and pinned externals"
             echo "::error::that are no longer reproducible on current runners. Not supported."
             exit 1
           fi
 
-          # --- 3. Confirm the tag actually exists upstream (catches typos cheaply) ---
           TAG="v$VER"
           if ! git ls-remote --exit-code --tags https://github.com/python/cpython "refs/tags/$TAG" >/dev/null 2>&1; then
             echo "::error::Tag '$TAG' was not found in python/cpython."
@@ -127,9 +108,8 @@ jobs:
             exit 1
           fi
 
-          # --- 4. Derive Windows toolset + minimum-OS floor + doc regime from the version ---
-          TOOLSET=""          # empty => MSBuild uses native v143
-          NEEDS_DOCS="false"  # "legacy" doc regime where the installer bundle requires a .chm
+          TOOLSET=""
+          NEEDS_DOCS="false"
           if [[ "$MINOR" -le 10 ]]; then TOOLSET="v142"; NEEDS_DOCS="true"; fi
 
           if   [[ "$MINOR" -le 8  ]]; then MINWIN="Windows 7";
@@ -145,7 +125,6 @@ jobs:
             echo "min_windows=$MINWIN"
           } >> "$GITHUB_OUTPUT"
 
-          # --- 5. Human-readable plan in the run summary ---
           {
             echo "### Build plan"
             echo ""
@@ -160,10 +139,6 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # ---------------------------------------------------------------------------
-  # 2a. WINDOWS — interpreter + python.org-style .exe installer.
-  #     Best-effort installer with a guaranteed portable-zip fallback.
-  # ---------------------------------------------------------------------------
   build-windows:
     name: Windows x86-64 installer
     needs: plan
@@ -171,7 +146,6 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 150
     env:
-      # Forces the toolset for the whole job (interpreter + installer). Empty for 3.11+.
       PlatformToolset: ${{ needs.plan.outputs.windows_toolset }}
     steps:
       - name: Checkout CPython ${{ needs.plan.outputs.tag }}
@@ -220,20 +194,12 @@ jobs:
           $out = Join-Path $env:GITHUB_WORKSPACE 'dist'
           New-Item -ItemType Directory -Force -Path $out | Out-Null
 
-          # PGO control differs by version:
-          #   <=3.10 : no --skip-pgo flag exists; a trivial training job (-V) avoids the
-          #            multi-hour test-suite run unless the user requested an optimized build.
-          #   3.11+  : --skip-pgo gives a fast non-PGO build.
           $pgo = @()
           if ('${{ inputs.optimize }}' -ne 'true') {
             if ('${{ needs.plan.outputs.needs_docs }}' -eq 'true') { $pgo = @('--pgo','-V') }
             else { $pgo = @('--skip-pgo') }
           }
 
-          # Documentation handling differs by version:
-          #   <=3.10 : the bundle requires a compiled .chm -> install HTML Help Workshop +
-          #            a working Sphinx, then let buildrelease build the docs. (Fragile on EOL.)
-          #   3.11+  : --skip-doc opts out cleanly (no HTML Help Workshop needed).
           $docflag = @()
           if ('${{ needs.plan.outputs.needs_docs }}' -eq 'true') {
             choco install html-help-workshop -y --no-progress
@@ -246,17 +212,15 @@ jobs:
             $docflag = @('--skip-doc')
           }
 
-          # Build the argument array — no string joining, so spaces in $out are safe.
-          $brArgs = @('-x64', '--skip-nuget', '-o', $out) + $pgo + $docflag
-
+          $brArgs = @('-x64','--skip-nuget','-o',$out) + $pgo + $docflag
+          $brArgsStr = $brArgs -join ' '
+          
           Write-Host "=== PRIMARY: Running Tools\msi\buildrelease.bat ==="
-          Write-Host "Args: $($brArgs -join ' ')"
-
-          # Use PowerShell's & call operator with splatted array (@brArgs).
-          # This correctly handles spaces in the path and in each argument,
-          # unlike `cmd /c "path" argstring` which mangled quotes on paths with spaces.
-          & "$env:GITHUB_WORKSPACE\Tools\msi\buildrelease.bat" @brArgs 2>&1
-
+          Write-Host "Tools\msi\buildrelease.bat $brArgsStr"
+          
+          # Use cmd /c and 2>&1 to prevent PowerShell from swallowing stderr
+          cmd /c `"$env:GITHUB_WORKSPACE\Tools\msi\buildrelease.bat`" $brArgsStr 2>&1
+          
           Write-Host "=== buildrelease.bat exit code: $LASTEXITCODE ==="
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -264,10 +228,11 @@ jobs:
         if: always() && steps.installer.outcome == 'failure'
         shell: pwsh
         run: |
-          Write-Host "Installer did not complete (expected for some EOL <=3.10 docs). Producing a portable interpreter instead."
-
-          & "$env:GITHUB_WORKSPACE\PCbuild\build.bat" -p x64 -c Release 2>&1
-
+          Write-Host "=== FALLBACK: Running PCbuild\build.bat ==="
+          
+          # Use cmd /c and 2>&1 to prevent PowerShell from swallowing stderr
+          cmd /c `"$env:GITHUB_WORKSPACE\PCbuild\build.bat`" -p x64 -c Release 2>&1
+          
           Write-Host "=== build.bat exit code: $LASTEXITCODE ==="
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -286,7 +251,6 @@ jobs:
         run: |
           $out = Join-Path $env:GITHUB_WORKSPACE 'dist'
           New-Item -ItemType Directory -Force -Path $out | Out-Null
-          # buildrelease also drops installers under PCbuild\amd64\en-us; gather those too.
           Get-ChildItem "$env:GITHUB_WORKSPACE\PCbuild\amd64\en-us" -Include *.exe,*.zip -Recurse -ErrorAction SilentlyContinue |
             Copy-Item -Destination $out -ErrorAction SilentlyContinue
 
@@ -309,9 +273,6 @@ jobs:
           path: dist/**
           if-no-files-found: error
 
-  # ---------------------------------------------------------------------------
-  # 2b. LINUX — Debian/Ubuntu family. Native runner; tarball of a make install.
-  # ---------------------------------------------------------------------------
   build-linux-debian:
     name: Linux (Debian/Ubuntu family) x86-64
     needs: plan
@@ -352,7 +313,7 @@ jobs:
         run: |
           set -euo pipefail
           VER='${{ inputs.python_version }}'
-          MM="${VER%.*}"                       # major.minor, e.g. 3.8
+          MM="${VER%.*}"                       
           mkdir -p "$GITHUB_WORKSPACE/dist"
           TARBALL="python-$VER-debian-ubuntu-x86_64.tar.gz"
           tar -C "$GITHUB_WORKSPACE/_install" -czf "$GITHUB_WORKSPACE/dist/$TARBALL" "python-$VER"
@@ -374,17 +335,11 @@ jobs:
           path: dist/**
           if-no-files-found: error
 
-  # ---------------------------------------------------------------------------
-  # 2c. LINUX — Fedora/RHEL family. Runs inside a Fedora container.
-  # ---------------------------------------------------------------------------
   build-linux-fedora:
     name: Linux (Fedora/RHEL family) x86-64
     needs: plan
     if: inputs.target_os == 'fedora'
     runs-on: ubuntu-24.04
-    # Pin to a specific supported release (e.g. fedora:41) for reproducibility.
-    # Note: an end-of-life tag still pulls, but its dnf repos move to archive and
-    # `dnf install` may fail — hence `latest` here for "it just works".
     container: fedora:latest
     timeout-minutes: 120
     steps:
